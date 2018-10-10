@@ -5,6 +5,7 @@ library(tidyverse)
 library(igraph)
 
 
+
 # Get data ----------------------------------------------------------------
 #' The source of data: http://opendata.praha.eu
 

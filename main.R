@@ -2,6 +2,7 @@
 
 # library(data.table)
 library(tidyverse)
+library(geosphere)
 library(igraph)
 
 
@@ -10,7 +11,7 @@ library(igraph)
 #' The source of data: http://opendata.praha.eu
 
 
-dir.create("_temp")
+dir.create("_temp", showWarnings = FALSE)
 fl <- "_temp/jrdata.zip"
 
 download.file("http://opendata.iprpraha.cz/DPP/JR/jrdata.zip", fl)
@@ -26,19 +27,46 @@ jr.data <- sapply(pth.fls[-1], readr::read_csv, locale = locale("cs"))
 names(jr.data) <- names(jr.data) %>% basename %>% str_remove("[.].*$")
 
 
-# agency -- kdo obsluhuje
-# calendar -- ve ktere dny jede
-# calendar_dates -- dny ve vyberu
-# linka (konecna-konecna, id, kdo obsluhuje, cislo, prip. barva)
-# shapes -- 3332 tvarů na povrhcu zeme
-# stop_times -- zastavkove casy (pro kazdou zastavku kazdou linku příjezdy a odjezdy)
+
+# Stop's id recode --------------------------------------------------------
+#' To save some space lets recode stop's id to just id..
+
+d.stops_id_dict <- jr.data$stops %>%
+  mutate(stop_id_orig = stop_id, stop_id = row_number()) %>% 
+  select(stop_id, stop_id_orig, stop_name, location_type, parent_station, wheelchair_boarding)
+
+jr.data$stops <- jr.data$stops %>%
+  rename(stop_id_orig = stop_id) %>% 
+  left_join(select(d.stops_id_dict, stop_id, stop_id_orig), by = "stop_id_orig") %>% 
+  select(stop_id, stop_lat, stop_lon)
+
+jr.data$stop_times <- jr.data$stop_times %>% 
+  rename(stop_id_orig = stop_id) %>% 
+  left_join(select(d.stops_id_dict, stop_id, stop_id_orig), by = "stop_id_orig") %>% 
+  select(trip_id, stop_id, arrival_time, departure_time, stop_sequence)
 
 
 
+# Count walking distances between stops -----------------------------------
+#' Let's make it simpliest - just count the distance on Earth's surface and then multiply it 
+#' by average human's walking speed. Then add some overhead penalty.
+
+c.walk_overhead_penalty_secs <- 30 # penalty for changing means of transport, secs
+c.avg_walking_speed <-  1.4 # source: wikipedia.org
+
+
+d.stops_dist <- geosphere::distm(jr.data$stops[,c("stop_lon", "stop_lat")]) %>%
+  as.dist %>%
+  broom::tidy(diagonal = FALSE, upper = FALSE) %>% 
+  mutate(duration = distance/c.avg_walking_speed + c.walk_overhead_penalty_secs) %>% 
+  select(-distance) %>% 
+  rename(stop_id.d = item1, stop_id.a = item2)
+
+  
 # Create stop-stop segments -----------------------------------------------
 
 d.depart <- jr.data$stop_times %>%
-  select(trip_id, stop_sequence, stop_id, departure_time) %>% 
+  select(-arrival_time) %>% 
   rename(stop_id.d = stop_id)
 
 d.arrival <- jr.data$stop_times %>% 
@@ -49,27 +77,11 @@ d.arrival <- jr.data$stop_times %>%
 d.segments <- d.depart %>%
   inner_join(d.arrival, by = c("trip_id" = "trip_id", "stop_sequence" = "prev_stop_sequence")) %>% 
   rename(segment_sequence = stop_sequence) %>% 
-  select(trip_id, segment_sequence, stop_id.d, stop_id.a, departure_time, arrival_time, waiting_time.a)
+  select(trip_id, segment_sequence, stop_id.d, stop_id.a, departure_time, arrival_time, waiting_time.a) %>% 
+  mutate(duration = arrival_time - departure_time)
 
-d.segments <- d.segments %>% mutate(duration_time = arrival_time - departure_time)
-  
-# test if there is multiple durations between two stops (maybe using different means of transport...)
+rm(d.arrival, d.depart)
 
-
-# Docasne omezeni ---------------------------------------------------------
-
-# warning("Prozatim omezim na cast, pak odmazat!") # TODO
-# d.segments <- head(d.segments, 10)
-# 
-# 
-# d.segments <- jr.data$stops %>%
-#   select(stop_id, stop_name) %>%
-#   rename(stop_name.d = stop_name) %>%
-#   right_join(d.segments, by = c("stop_id" = "stop_id.d"))
-# d.segments <- jr.data$stops %>% 
-#   select(stop_id, stop_name) %>% 
-#   rename(stop_name.a = stop_name) %>% 
-#   right_join(d.segments, by = c("stop_id" = "stop_id.a"))
 
 
 # Build a graph of stops --------------------------------------------------
@@ -77,20 +89,23 @@ d.segments <- d.segments %>% mutate(duration_time = arrival_time - departure_tim
 # g <- igraph::graph_from_data_frame(d.segments[,c("stop_name.d", "stop_name.a")], directed = TRUE)
 g <- igraph::graph_from_data_frame(d.segments[,c("stop_id.d", "stop_id.a")], directed = TRUE)
 
-d.segments.summary <- d.segments %>% group_by(stop_id.d, stop_id.a) %>%
-  summarise(min_duration = min(duration_time, na.rm = TRUE),
-            avg_duration = mean(duration_time, na.rm = TRUE),
-            max_duration = max(duration_time, na.rm = TRUE),
-            n_trips = n()) %>% 
-  mutate(edge_label = str_c(stop_id.d,"|",stop_id.a))
-
 
 E(g)$weight <- d.segments.summary$min_duration[match(attr(E(g), "vnames"), d.segments.summary$edge_label)]
+E(g)$departure_time
+E(g)$trip_id
+
+#' TODO:
+#'  * přidej do grafu spojnice zastávek pěší chůzí (manhattan distance * odhad rychlosti + nějaká konstanta na režii)
+#'  * přidej vlastnosti hran "departure_time, arrival_time, trip_id"
+#'  * myšlenka:
+#'     - pokud jsem ve vrcholu V a čase T, mohu vzít jen hrany v čase t+konst, pokud přestupuji a t, pokud jde o stejný trip_id
+#' * graf by měl mít více hran mezi týmiž vrcholy --> !simplify
+
 
 
 # this counts theoretic minimum; but
 igraph::distances(g, v = "U179Z5", to = "U171Z1") 
-igraph::shortest.paths(g, v = "U179Z5", to = "U171Z", )
+igraph::shortest.paths(g, v = "U179Z5", to = "U171Z1")
 # igraph::get.all.shortest.paths(g, from = "U179Z5", to = "U171Z1")
 
 

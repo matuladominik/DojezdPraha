@@ -4,7 +4,7 @@
 library(tidyverse)
 library(geosphere)
 library(igraph)
-
+library(lubridate)
 
 
 # Get data ----------------------------------------------------------------
@@ -25,6 +25,45 @@ pth.fls <- dir(pth.dir, full.names = TRUE)
 jr.info <- readr::read_delim(pth.fls[1], delim = ":", skip = 2, locale = locale("cs", encoding = "windows-1250"), col_names = c("co", "hodnota"))
 jr.data <- sapply(pth.fls[-1], readr::read_csv, locale = locale("cs"))
 names(jr.data) <- names(jr.data) %>% basename %>% str_remove("[.].*$")
+
+
+
+# Filter data  ------------------------------------------------------------
+#' Let's downdize the data just to the day we are interested in.
+#' (Plus we'll add next day - just to complete trips startet before midnight..).
+
+jr.data$calendar <- jr.data$calendar %>%
+  mutate(start_date = ymd(start_date),
+         end_date = ymd(end_date))
+
+jr.data$calendar_dates <- jr.data$calendar_dates %>% mutate(date = ymd(date))
+
+# pick dates
+c.days <- jr.data$calendar_dates$date %>% sample(1)
+c.days <- c.days + 0:1
+
+
+# filter datasets
+jr.data$calendar <- jr.data$calendar %>%
+  filter(start_date <= c.days[1], end_date >= c.days[2])
+
+available_services <- jr.data$calendar$service_id
+
+# Optionaly - remove services with an exception..
+# jr.data$calendar_dates <- jr.data$calendar_dates %>% 
+#   filter(date %in% c.days, exception_type == 2)
+# available_services <- setdiff(available_services, jr.data$calendar_dates$service_id)
+
+# Remove unavailable services
+jr.data$trips <- jr.data$trips %>% 
+  filter(service_id %in% available_services)
+
+available_trips <- jr.data$trips$trip_id %>% unique
+jr.data$stop_times <- jr.data$stop_times %>% 
+  filter(trip_id %in% available_trips)
+
+available_stops <- jr.data$stop_times$stop_id %>% unique
+jr.data$stops <- jr.data$stops %>% filter(stop_id %in% available_stops)
 
 
 
@@ -61,6 +100,39 @@ d.stops_dist <- geosphere::distm(jr.data$stops[,c("stop_lon", "stop_lat")]) %>%
   mutate(duration = distance/c.avg_walking_speed + c.walk_overhead_penalty_secs) %>% 
   select(-distance) %>% 
   rename(stop_id.d = item1, stop_id.a = item2)
+
+
+# Create trips 
+#' For each trip 
+#' 
+
+stops_seq <- seq(max(jr.data$stop_times$stop_sequence))
+stops_seq_paris <- expand.grid(stops_seq, stops_seq) %>%
+  rename(stop_seq_id.d = Var1, stop_seq_id.a = Var2) %>% 
+  filter(stop_seq_id.d < stop_seq_id.a)
+
+l.sub_paths <- stops_seq_paris%>% 
+  apply(1, function(comb){
+    
+    d.departure = jr.data$stop_times %>% 
+      filter(stop_sequence == comb["stop_seq_id.d"]) %>% 
+      select(trip_id, stop_id, departure_time) %>% 
+      rename(stop_id.d = stop_id)
+    d.arrival = jr.data$stop_times %>% 
+      filter(stop_sequence == comb["stop_seq_id.a"]) %>% 
+      select(trip_id, stop_id, arrival_time) %>% 
+      rename(stop_id.a = stop_id)
+    
+    d.path = inner_join(d.departure, d.arrival, by = c("trip_id")) %>% 
+      mutate(duration = arrival_time - departure_time) %>% 
+      select(stop_id.d, stop_id.a, departure_time, duration)
+  })
+d.sub_paths <- do.call("rbind", l.sub_paths)
+rm(l.sub_paths)
+
+
+
+
 
   
 # Create stop-stop segments -----------------------------------------------

@@ -3,8 +3,9 @@
 # library(data.table)
 library(tidyverse)
 library(geosphere)
-library(igraph)
+# library(igraph)
 library(lubridate)
+library(ggmap)
 
 
 # Get data ----------------------------------------------------------------
@@ -14,10 +15,10 @@ library(lubridate)
 dir.create("_temp", showWarnings = FALSE)
 fl <- "_temp/jrdata.zip"
 
-download.file("http://opendata.iprpraha.cz/DPP/JR/jrdata.zip", fl)
+# download.file("http://opendata.iprpraha.cz/DPP/JR/jrdata.zip", fl)
 
 pth.dir <-  "_temp/jrdata"
-unzip(fl, exdir = pth.dir)
+# unzip(fl, exdir = pth.dir)
 
 pth.fls <- dir(pth.dir, full.names = TRUE)
 
@@ -47,28 +48,50 @@ c.days <- c.days + 0:1
 jr.data$calendar <- jr.data$calendar %>%
   filter(start_date <= c.days[1], end_date >= c.days[2])
 
-available_services <- jr.data$calendar$service_id
+l.available_services <- lapply(c.days,function(i_day) {
+  
+  i_wday <- lubridate::wday(i_day, week_start = 1, label = TRUE, abbr = FALSE,
+                            locale = "English_United States.1252") %>% str_to_lower()
+  
+  kt <- jr.data$calendar[,i_wday] == 1
+  jr.data$calendar$service_id[kt]
+})
+names(l.available_services) <- c.days
+  
 
 # Optionaly - remove services with an exception..
 # jr.data$calendar_dates <- jr.data$calendar_dates %>% 
 #   filter(date %in% c.days, exception_type == 2)
-# available_services <- setdiff(available_services, jr.data$calendar_dates$service_id)
+# l.available_services <- lapply(l.available_services, function(available_services) {
+#   setdiff(available_services, jr.data$calendar_dates$service_id)
+# })
 
 # Remove unavailable services
 jr.data$trips <- jr.data$trips %>% 
-  filter(service_id %in% available_services)
+  filter(service_id %in% unlist(l.available_services))
 
-available_trips <- jr.data$trips$trip_id %>% unique
+l.available_trips <- lapply(l.available_services, function(available_services) {
+  jr.data$trips %>% 
+    filter(service_id %in% available_services) %>% 
+    select(trip_id) %>% 
+    unlist(use.names = FALSE) %>% 
+    unique
+})
+
 jr.data$stop_times <- jr.data$stop_times %>% 
-  filter(trip_id %in% available_trips)
+  filter(trip_id %in% unlist(l.available_trips))
 
 available_stops <- jr.data$stop_times$stop_id %>% unique
 jr.data$stops <- jr.data$stops %>% filter(stop_id %in% available_stops)
 
 
+# also remove stop times without arrival/departure time specified
+jr.data$stop_times <- jr.data$stop_times %>% 
+  filter(!is.na(arrival_time) & !is.na(departure_time))
+
 
 # Stop's id recode --------------------------------------------------------
-#' To save some space lets recode stop's id to just id..
+#' To save some space lets recode stop's id to just id.
 
 d.stops_id_dict <- jr.data$stops %>%
   mutate(stop_id_orig = stop_id, stop_id = row_number()) %>% 
@@ -84,112 +107,134 @@ jr.data$stop_times <- jr.data$stop_times %>%
   left_join(select(d.stops_id_dict, stop_id, stop_id_orig), by = "stop_id_orig") %>% 
   select(trip_id, stop_id, arrival_time, departure_time, stop_sequence)
 
+# also we'll make concrete departure/arrival times
+
+temp_stop_times <- lapply(as.character(c.days), function(i_day) {
+  
+  available_trips <- l.available_trips[[i_day]]
+  
+  jr.data$stop_times %>% 
+    filter(trip_id %in% available_trips) %>% 
+    mutate(arrival_time = as_datetime(paste(i_day, arrival_time)),
+           departure_time = as_datetime(paste(i_day, departure_time)))
+})
+jr.data$stop_times <- do.call("rbind", temp_stop_times)
+rm(temp_stop_times)
+
 
 
 # Count walking distances between stops -----------------------------------
 #' Let's make it simpliest - just count the distance on Earth's surface and then multiply it 
 #' by average human's walking speed. Then add some overhead penalty.
+#' 
+#' Optionally - use manhattan distance to reflect necesity of following roads etc. 
 
 c.walk_overhead_penalty_secs <- 30 # penalty for changing means of transport, secs
 c.avg_walking_speed <-  1.4 # source: wikipedia.org
 
 
-d.stops_dist <- geosphere::distm(jr.data$stops[,c("stop_lon", "stop_lat")]) %>%
+d.stops_walking_dist <- geosphere::distm(jr.data$stops[,c("stop_lon", "stop_lat")]) %>%
   as.dist %>%
   broom::tidy(diagonal = FALSE, upper = FALSE) %>% 
   mutate(duration = distance/c.avg_walking_speed + c.walk_overhead_penalty_secs) %>% 
   select(-distance) %>% 
   rename(stop_id.d = item1, stop_id.a = item2)
 
+# d.stops_walking_dist$trip_id <- 0  # 0 means use your legs :)
+# d.stops_walking_dist$departure_time <- NA # and you can start whenever you want
+
 
 # Create trips 
-#' For each trip 
+#' For each trip we will take into account possibility to use it for 1-k stops (starting on
+#' whichever stop you want...)
 #' 
 
 stops_seq <- seq(max(jr.data$stop_times$stop_sequence))
-stops_seq_paris <- expand.grid(stops_seq, stops_seq) %>%
+stops_seq_pairs <- expand.grid(stops_seq, stops_seq) %>%
   rename(stop_seq_id.d = Var1, stop_seq_id.a = Var2) %>% 
   filter(stop_seq_id.d < stop_seq_id.a)
 
-l.sub_paths <- stops_seq_paris%>% 
+l.sub_paths <- stops_seq_pairs%>% 
   apply(1, function(comb){
     
-    d.departure = jr.data$stop_times %>% 
+    d.departure <- jr.data$stop_times %>% 
       filter(stop_sequence == comb["stop_seq_id.d"]) %>% 
       select(trip_id, stop_id, departure_time) %>% 
       rename(stop_id.d = stop_id)
-    d.arrival = jr.data$stop_times %>% 
+    d.arrival <- jr.data$stop_times %>% 
       filter(stop_sequence == comb["stop_seq_id.a"]) %>% 
       select(trip_id, stop_id, arrival_time) %>% 
       rename(stop_id.a = stop_id)
     
-    d.path = inner_join(d.departure, d.arrival, by = c("trip_id")) %>% 
-      mutate(duration = arrival_time - departure_time) %>% 
-      select(stop_id.d, stop_id.a, departure_time, duration)
+    d.path <- inner_join(d.departure, d.arrival, by = c("trip_id")) %>% 
+      filter(arrival_time >= departure_time & arrival_time < departure_time + ddays(1)) %>% 
+      select(stop_id.d, stop_id.a, departure_time, arrival_time)
   })
 d.sub_paths <- do.call("rbind", l.sub_paths)
 rm(l.sub_paths)
 
 
-
-
-
-  
-# Create stop-stop segments -----------------------------------------------
-
-d.depart <- jr.data$stop_times %>%
-  select(-arrival_time) %>% 
-  rename(stop_id.d = stop_id)
-
-d.arrival <- jr.data$stop_times %>% 
-  mutate(waiting_time.a = departure_time - arrival_time, prev_stop_sequence = stop_sequence -1) %>% 
-  select(trip_id, prev_stop_sequence, stop_id, arrival_time, waiting_time.a) %>% 
-  rename(stop_id.a = stop_id)
-
-d.segments <- d.depart %>%
-  inner_join(d.arrival, by = c("trip_id" = "trip_id", "stop_sequence" = "prev_stop_sequence")) %>% 
-  rename(segment_sequence = stop_sequence) %>% 
-  select(trip_id, segment_sequence, stop_id.d, stop_id.a, departure_time, arrival_time, waiting_time.a) %>% 
-  mutate(duration = arrival_time - departure_time)
-
-rm(d.arrival, d.depart)
-
-
-
-# Build a graph of stops --------------------------------------------------
-
-# g <- igraph::graph_from_data_frame(d.segments[,c("stop_name.d", "stop_name.a")], directed = TRUE)
-g <- igraph::graph_from_data_frame(d.segments[,c("stop_id.d", "stop_id.a")], directed = TRUE)
-
-
-E(g)$weight <- d.segments.summary$min_duration[match(attr(E(g), "vnames"), d.segments.summary$edge_label)]
-E(g)$departure_time
-E(g)$trip_id
-
-#' TODO:
-#'  * přidej do grafu spojnice zastávek pěší chůzí (manhattan distance * odhad rychlosti + nějaká konstanta na režii)
-#'  * přidej vlastnosti hran "departure_time, arrival_time, trip_id"
-#'  * myšlenka:
-#'     - pokud jsem ve vrcholu V a čase T, mohu vzít jen hrany v čase t+konst, pokud přestupuji a t, pokud jde o stejný trip_id
-#' * graf by měl mít více hran mezi týmiž vrcholy --> !simplify
-
-
-
-# this counts theoretic minimum; but
-igraph::distances(g, v = "U179Z5", to = "U171Z1") 
-igraph::shortest.paths(g, v = "U179Z5", to = "U171Z1")
-# igraph::get.all.shortest.paths(g, from = "U179Z5", to = "U171Z1")
-
-
-
-## TODO: přidej ztotožnění zastávek se stejným jménem (!přestupy)
-## TODO: přidej vyhodnocení skutečné doby
-## TODO: přidej vyhledávání do hloubky alternativních tras
-
-
+# d.stops_dist <- rbind(d.sub_paths, d.stops_walking_dist[,colnames(d.sub_paths)])
+# rm(d.stops_walking_dist, d.sub_paths)
+gc()
 
 
 # Computing distances to given stop (at given time) -----------------------
+
+init_stop <-  2539
+init_time <- lubridate::ymd_hms(paste(as.character(c.days[1]),"07:00:00"))
+c.max_iter <- 1e2
+
+# init - distance by walk/one vehicle 
+d.best <- d.stops_walking_dist %>% 
+  filter(stop_id.d == init_stop) %>%
+  mutate(arrival_time = duration + init_time, 
+         updated = (stop_id.a == init_stop)) %>% 
+  rename(stop_id = stop_id.a) %>% 
+  select(stop_id, arrival_time, updated)
+
+d.best <- rbind(d.best,
+                tibble(stop_id = init_stop,
+                       arrival_time = init_time,
+                       updated = TRUE))
+
+
+iter.no <- 0
+n.updated <- sum(d.best$updated)
+
+
+while (iter.no < c.max_iter && n.updated > 0) {
+  
+  iter.no <- iter.no + 1
+  cat('Iter no. ', iter.no, ', last upd.:',n.updated,' (',as.character(Sys.time()),')\n')
+  
+  # TODO!! -> pro i>0:
+  # TODO!! -> move transfer overhead constant here (from walking time above)
+
+  d.vysetruji <- d.best %>% 
+    filter(updated == TRUE) %>% 
+    rename(prev_arrival_time = arrival_time) %>% 
+    select(stop_id, prev_arrival_time) 
+  
+  d.update <- d.sub_paths %>%
+    inner_join(d.vysetruji, by = c("stop_id.d" = "stop_id")) %>% 
+    filter(prev_arrival_time < departure_time) %>% 
+    group_by(stop_id.a) %>% 
+    summarise(new_arrival_time = min(arrival_time, na.rm = TRUE)) %>% 
+    left_join(d.best, by = c("stop_id.a" = "stop_id")) %>% 
+    filter(new_arrival_time < arrival_time | is.na(arrival_time)) %>% 
+    select(stop_id.a, new_arrival_time)
+  
+  d.best <- d.best %>% 
+    left_join(d.update, by = c("stop_id" = "stop_id.a")) %>% 
+    mutate(updated = !is.na(new_arrival_time),
+           arrival_time = pmin(new_arrival_time, arrival_time, na.rm = TRUE)) %>% 
+    select(stop_id, arrival_time, updated) 
+  
+  n.updated <- sum(d.best$updated)
+}
+
+
 
 
 
@@ -199,4 +244,41 @@ igraph::shortest.paths(g, v = "U179Z5", to = "U171Z1")
 
 # Visualisation -----------------------------------------------------------
 
+d.best <- d.best %>% 
+  left_join(d.stops_id_dict, by = "stop_id") %>% 
+  left_join(jr.data$stops, by = "stop_id") %>% 
+  mutate(min_duration = arrival_time - init_time)
 
+d.best %>% 
+  ggplot(aes(x = stop_lat, y = stop_lon, col = as.numeric(min_duration)/3600)) + 
+  geom_point() + 
+  theme_bw() + 
+  scale_color_viridis_c()
+
+d.best %>% 
+  filter(min_duration < 3600) %>% 
+  ggplot(aes(x = stop_lat, y = stop_lon, col = as.numeric(min_duration)/60)) + 
+  geom_point() + 
+  theme_bw() + 
+  scale_color_viridis_c()
+
+
+
+init_stop_spatial <- jr.data$stops %>% 
+  filter(stop_id == init_stop) %>% 
+  select(stop_lat, stop_lon) %>% 
+  unlist
+
+
+prague_map = ggmap::get_map(location = init_stop_spatial, maptype = "roadmap",
+                           zoom = 11, color = "bw")
+
+# install.packages("maps")
+
+library(ggmap)
+
+map_box <- ggmap::make_bbox(lon = jr.data$stops$stop_lon, lat = jr.data$stops$stop_lat, f = .01)
+
+m <- ggmap::get_stamenmap(map_box, maptype = "toner-hybrid")
+
+ggmap(m) + geom_point(data = jr.data$stops, aes(x = stop_lon, y = stop_lat, col = factor(location_type)))

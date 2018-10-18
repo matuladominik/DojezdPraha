@@ -125,18 +125,16 @@ rm(temp_stop_times)
 
 # Count walking distances between stops -----------------------------------
 #' Let's make it simpliest - just count the distance on Earth's surface and then multiply it 
-#' by average human's walking speed. Then add some overhead penalty.
+#' by average human's walking speed. 
 #' 
 #' Optionally - use manhattan distance to reflect necesity of following roads etc. 
 
-c.walk_overhead_penalty_secs <- 30 # penalty for changing means of transport, secs
 c.avg_walking_speed <-  1.4 # source: wikipedia.org
-
 
 d.stops_walking_dist <- geosphere::distm(jr.data$stops[,c("stop_lon", "stop_lat")]) %>%
   as.dist %>%
   broom::tidy(diagonal = FALSE, upper = FALSE) %>% 
-  mutate(duration = distance/c.avg_walking_speed + c.walk_overhead_penalty_secs) %>% 
+  mutate(duration = distance/c.avg_walking_speed) %>% 
   select(-distance) %>% 
   rename(stop_id.d = item1, stop_id.a = item2)
 
@@ -201,30 +199,45 @@ d.best <- rbind(d.best,
 
 iter.no <- 0
 n.updated <- sum(d.best$updated)
-
+c.transfer_overhead_secs <- 30    # overhead for each changing a mean of transport (even vehicle -> walk and vice versa)
 
 while (iter.no < c.max_iter && n.updated > 0) {
   
   iter.no <- iter.no + 1
   cat('Iter no. ', iter.no, ', last upd.:',n.updated,' (',as.character(Sys.time()),')\n')
   
-  # TODO!! -> pro i>0:
-  # TODO!! -> move transfer overhead constant here (from walking time above)
-
-  d.vysetruji <- d.best %>% 
+  # find stops with updated arrivals
+  d.checking <- d.best %>% 
     filter(updated == TRUE) %>% 
     rename(prev_arrival_time = arrival_time) %>% 
     select(stop_id, prev_arrival_time) 
   
-  d.update <- d.sub_paths %>%
-    inner_join(d.vysetruji, by = c("stop_id.d" = "stop_id")) %>% 
-    filter(prev_arrival_time < departure_time) %>% 
+  # try to use your legs
+  d.update_by_walk <- d.checking %>% 
+    inner_join(d.stops_walking_dist, by = c("stop_id" = "stop_id.d")) %>% 
+    mutate(arrival_time = prev_arrival_time + duration + c.transfer_overhead_secs,
+           prev_arrival_time = NULL, stop_id = NULL, duration = NULL) %>% 
     group_by(stop_id.a) %>% 
-    summarise(new_arrival_time = min(arrival_time, na.rm = TRUE)) %>% 
-    left_join(d.best, by = c("stop_id.a" = "stop_id")) %>% 
+    summarise(new_arrival_time = min(arrival_time, na.rm = TRUE))
+  
+  # try to use public transport
+  d.update_by_vehicle <- d.sub_paths %>%
+    inner_join(d.checking, by = c("stop_id.d" = "stop_id")) %>% 
+    filter(prev_arrival_time + c.transfer_overhead_secs < departure_time) %>% 
+    group_by(stop_id.a) %>% 
+    summarise(new_arrival_time = min(arrival_time, na.rm = TRUE))  
+    
+  # find the best of those ways for each destination
+  d.update <- rbind(d.update_by_walk, d.update_by_vehicle) %>% 
+    group_by(stop_id.a) %>% 
+    summarise(new_arrival_time = min(new_arrival_time, na.rm = TRUE))
+  
+  # check if you make some best times
+  d.update <- d.update %>% left_join(d.best, by = c("stop_id.a" = "stop_id")) %>% 
     filter(new_arrival_time < arrival_time | is.na(arrival_time)) %>% 
     select(stop_id.a, new_arrival_time)
   
+  # do some updates (if any)
   d.best <- d.best %>% 
     left_join(d.update, by = c("stop_id" = "stop_id.a")) %>% 
     mutate(updated = !is.na(new_arrival_time),
